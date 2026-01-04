@@ -1,0 +1,225 @@
+name: Databricks Apply on PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+      - master
+      - develop
+      - release
+
+jobs:
+  databricks-apply:
+    # Only run if the PR was merged (not just closed)
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Extract Environment from Branch
+        id: env
+        run: |
+          BRANCH="${{ github.event.pull_request.base.ref }}"
+
+          # Map branches to environments
+          if [[ "$BRANCH" == "develop" ]]; then
+            ENVIRONMENT="dev"
+          elif [[ "$BRANCH" == "release" ]]; then
+            ENVIRONMENT="qa"
+          elif [[ "$BRANCH" == "master" ]]; then
+            ENVIRONMENT="prod"
+          elif [[ "$BRANCH" == "main" ]]; then
+            ENVIRONMENT="dev"
+          else
+            ENVIRONMENT="dev"
+          fi
+
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "📍 Deploying to environment: $ENVIRONMENT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli databricks-sdk
+          databricks --version
+
+      - name: Configure Databricks Authentication
+        run: |
+          echo "✅ Databricks authentication configured"
+          echo "Workspace: ${{ secrets.DATABRICKS_HOST }}"
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+
+      - name: Detect Changed Terragrunt Files
+        id: changes
+        run: |
+          echo "🔍 Detecting changed Terragrunt files in PR #${{ github.event.pull_request.number }}"
+
+          # Get list of changed files in the PR
+          CHANGED_FILES=$(gh pr view ${{ github.event.pull_request.number }} --json files -q '.files[].path' || echo "")
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Find terragrunt.hcl files
+          TERRAGRUNT_FILES=$(echo "$CHANGED_FILES" | grep "terragrunt.hcl$" || echo "")
+
+          if [ -z "$TERRAGRUNT_FILES" ]; then
+            echo "⚠️ No terragrunt.hcl files found in PR changes"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Found terragrunt.hcl files:"
+            echo "$TERRAGRUNT_FILES"
+
+            # Extract directory paths (remove /terragrunt.hcl)
+            DIRECTORIES=$(echo "$TERRAGRUNT_FILES" | sed 's|/terragrunt.hcl$||' | tr '\n' ',' | sed 's/,$//')
+
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "directories=$DIRECTORIES" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Databricks Plan and Apply
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          IFS=',' read -ra DIRS <<< "${{ steps.changes.outputs.directories }}"
+
+          for dir in "${DIRS[@]}"; do
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📁 Processing: $dir"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            if [ ! -d "$dir" ]; then
+              echo "⚠️ Directory $dir does not exist, skipping"
+              continue
+            fi
+
+            cd "$dir"
+
+            # Rename terragrunt.hcl to main.tf for Terraform compatibility
+            if [ -f "terragrunt.hcl" ]; then
+              mv terragrunt.hcl main.tf
+            fi
+
+            echo ""
+            echo "🔧 Terraform Init"
+            terraform init
+
+            echo ""
+            echo "📋 Terraform Plan"
+            terraform plan -out=tfplan
+
+            echo ""
+            echo "🚀 Terraform Apply"
+            terraform apply -auto-approve tfplan
+
+            echo ""
+            echo "✅ Successfully applied Terraform configuration in $dir"
+            echo ""
+
+            cd - > /dev/null
+          done
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ All Databricks configurations applied successfully"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+      - name: Comment on PR with Results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const hasChanges = '${{ steps.changes.outputs.has_changes }}' === 'true';
+            const environment = '${{ steps.env.outputs.environment }}';
+            const prNumber = ${{ github.event.pull_request.number }};
+            const success = '${{ job.status }}' === 'success';
+
+            let body;
+
+            if (!hasChanges) {
+              body = '## ⚠️ No Databricks Changes Detected\n\n' +
+                     'No `terragrunt.hcl` files were modified in this PR.\n\n' +
+                     '**Environment:** `' + environment + '`\n' +
+                     '**PR:** #' + prNumber + '\n' +
+                     '**Workflow:** [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n';
+            } else if (success) {
+              const directories = '${{ steps.changes.outputs.directories }}'.split(',');
+              const dirList = directories.map(d => '  - `' + d + '`').join('\n');
+
+              body = '## ✅ Databricks Apply Successful\n\n' +
+                     'Databricks resources have been successfully provisioned!\n\n' +
+                     '**Environment:** `' + environment + '`\n' +
+                     '**PR:** #' + prNumber + '\n' +
+                     '**Applied Configurations:**\n' +
+                     dirList + '\n\n' +
+                     '**Workflow:** [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n' +
+                     '### Next Steps\n' +
+                     '- Verify resources in Databricks Workspace\n' +
+                     '- Check Backstage portal for updated resource status\n' +
+                     '- User will be notified of completion\n';
+            } else {
+              body = '## ❌ Databricks Apply Failed\n\n' +
+                     'Databricks provisioning encountered errors.\n\n' +
+                     '**Environment:** `' + environment + '`\n' +
+                     '**PR:** #' + prNumber + '\n' +
+                     '**Workflow:** [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n' +
+                     'Please check the workflow logs for details.\n';
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: body
+            });
+
+      - name: Deployment Summary
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<'EOF'
+          ## 🚀 Databricks Deployment Complete
+
+          ### Deployment Details
+          - **Environment:** `${{ steps.env.outputs.environment }}`
+          - **Branch:** `${{ github.event.pull_request.base.ref }}`
+          - **PR:** #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}
+          - **Author:** @${{ github.event.pull_request.user.login }}
+
+          ### Applied Configurations
+          ```
+          ${{ steps.changes.outputs.directories }}
+          ```
+
+          ### Status
+          ✅ All Databricks configurations applied successfully
+
+          ### Links
+          - 🔗 [PR Details](${{ github.event.pull_request.html_url }})
+          - 🔗 [Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - 🔗 [Databricks Workspace](${{ secrets.DATABRICKS_HOST }})
+
+          EOF
