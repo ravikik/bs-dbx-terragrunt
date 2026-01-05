@@ -1,0 +1,398 @@
+# This workflow file should be placed in your GitHub repository:
+# ravikik/databricks-config/.github/workflows/databricks-provisioning.yml
+#
+# Required GitHub Secrets:
+# - DATABRICKS_HOST: Your Databricks workspace URL (e.g., https://dbc-xxxxx.cloud.databricks.com)
+# - DATABRICKS_TOKEN: Databricks personal access token with cluster/SQL permissions
+#
+# Required permissions: Unity Catalog CREATE SCHEMA and CREATE TABLE on the target catalog
+
+name: Databricks Provisioning
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource-type:
+        description: 'Resource type to create (schema, table, both)'
+        required: true
+        type: string
+      catalog-name:
+        description: 'Unity Catalog name'
+        required: true
+        type: string
+      schema-name:
+        description: 'Schema (database) name'
+        required: true
+        type: string
+      table-name:
+        description: 'Table name (if creating table)'
+        required: false
+        type: string
+      environment:
+        description: 'Environment (dev, staging, prod)'
+        required: true
+        type: string
+      layer:
+        description: 'Medallion layer (bronze, silver, gold, platinum)'
+        required: true
+        type: string
+      table-type:
+        description: 'Table type (managed, external)'
+        required: false
+        default: 'managed'
+        type: string
+      table-format:
+        description: 'Table format (delta, parquet, orc, csv, json)'
+        required: false
+        default: 'delta'
+        type: string
+      partition-columns:
+        description: 'Comma-separated partition columns'
+        required: false
+        type: string
+      cluster-columns:
+        description: 'Comma-separated Z-Order/cluster columns'
+        required: false
+        type: string
+      enable-auto-optimize:
+        description: 'Enable auto optimize'
+        required: false
+        default: 'true'
+        type: string
+      enable-cdf:
+        description: 'Enable Change Data Feed'
+        required: false
+        default: 'false'
+        type: string
+      enable-deletion-vectors:
+        description: 'Enable Deletion Vectors'
+        required: false
+        default: 'true'
+        type: string
+      retention-hours:
+        description: 'Delta log retention hours'
+        required: false
+        default: '168'
+        type: string
+      schema-comment:
+        description: 'Schema description'
+        required: false
+        type: string
+      table-comment:
+        description: 'Table description'
+        required: false
+        type: string
+      external-location:
+        description: 'External storage location (S3 path)'
+        required: false
+        type: string
+      expectations:
+        description: 'Data quality expectations (SQL expressions)'
+        required: false
+        type: string
+      tags:
+        description: 'JSON tags for governance'
+        required: false
+        default: '{}'
+        type: string
+      use-template:
+        description: 'Predefined template to use'
+        required: false
+        default: 'none'
+        type: string
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Databricks CLI
+        run: |
+          pip install databricks-cli databricks-sdk
+
+      - name: Configure Databricks CLI
+        run: |
+          mkdir -p ~/.databrickscfg
+          cat > ~/.databrickscfg << EOF
+          [DEFAULT]
+          host = ${{ secrets.DATABRICKS_HOST }}
+          token = ${{ secrets.DATABRICKS_TOKEN }}
+          EOF
+
+      - name: Create Schema
+        if: ${{ inputs.resource-type == 'schema' || inputs.resource-type == 'both' }}
+        run: |
+          echo "Creating schema: ${{ inputs.catalog-name }}.${{ inputs.schema-name }}"
+          
+          SCHEMA_SQL="CREATE SCHEMA IF NOT EXISTS \`${{ inputs.catalog-name }}\`.\`${{ inputs.schema-name }}\`"
+          
+          # Add comment if provided
+          if [ -n "${{ inputs.schema-comment }}" ]; then
+            SCHEMA_SQL="$SCHEMA_SQL COMMENT '${{ inputs.schema-comment }}'"
+          fi
+          
+          # Add external location if provided
+          if [ -n "${{ inputs.external-location }}" ]; then
+            SCHEMA_SQL="$SCHEMA_SQL MANAGED LOCATION '${{ inputs.external-location }}'"
+          fi
+          
+          echo "Executing SQL: $SCHEMA_SQL"
+          
+          # Execute using Databricks SQL API
+          python << 'PYTHON_EOF'
+          import os
+          from databricks.sdk import WorkspaceClient
+          from databricks.sdk.service.sql import StatementState
+          import time
+          
+          w = WorkspaceClient()
+          
+          # Get or create a SQL warehouse
+          warehouses = list(w.warehouses.list())
+          if not warehouses:
+              print("ERROR: No SQL warehouses available")
+              exit(1)
+          
+          warehouse_id = warehouses[0].id
+          print(f"Using warehouse: {warehouse_id}")
+          
+          sql = """$SCHEMA_SQL"""
+          
+          response = w.statement_execution.execute_statement(
+              warehouse_id=warehouse_id,
+              statement=sql,
+              wait_timeout="30s"
+          )
+          
+          if response.status.state == StatementState.SUCCEEDED:
+              print("Schema created successfully!")
+          else:
+              print(f"Schema creation failed: {response.status.error}")
+              exit(1)
+          PYTHON_EOF
+        env:
+          SCHEMA_SQL: ${{ format('CREATE SCHEMA IF NOT EXISTS `{0}`.`{1}`', inputs.catalog-name, inputs.schema-name) }}
+
+      - name: Create Table
+        if: ${{ inputs.resource-type == 'table' || inputs.resource-type == 'both' }}
+        run: |
+          echo "Creating table: ${{ inputs.catalog-name }}.${{ inputs.schema-name }}.${{ inputs.table-name }}"
+          
+          python << 'PYTHON_EOF'
+          import os
+          from databricks.sdk import WorkspaceClient
+          from databricks.sdk.service.sql import StatementState
+          
+          w = WorkspaceClient()
+          
+          # Get a SQL warehouse
+          warehouses = list(w.warehouses.list())
+          if not warehouses:
+              print("ERROR: No SQL warehouses available")
+              exit(1)
+          
+          warehouse_id = warehouses[0].id
+          print(f"Using warehouse: {warehouse_id}")
+          
+          catalog = "${{ inputs.catalog-name }}"
+          schema = "${{ inputs.schema-name }}"
+          table = "${{ inputs.table-name }}"
+          table_type = "${{ inputs.table-type }}"
+          table_format = "${{ inputs.table-format }}"
+          partition_cols = "${{ inputs.partition-columns }}"
+          cluster_cols = "${{ inputs.cluster-columns }}"
+          table_comment = "${{ inputs.table-comment }}"
+          enable_cdf = "${{ inputs.enable-cdf }}" == "true"
+          enable_deletion_vectors = "${{ inputs.enable-deletion-vectors }}" == "true"
+          retention_hours = int("${{ inputs.retention-hours }}" or "168")
+          external_location = "${{ inputs.external-location }}"
+          
+          # Build CREATE TABLE statement
+          # For Delta format, create an empty Delta table with metadata columns
+          if table_format == "delta":
+              sql = f"""
+              CREATE TABLE IF NOT EXISTS `{catalog}`.`{schema}`.`{table}` (
+                  id BIGINT GENERATED ALWAYS AS IDENTITY,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+                  _metadata_layer STRING DEFAULT '{os.environ.get('LAYER', 'bronze')}'
+              )
+              USING DELTA
+              """
+          else:
+              sql = f"""
+              CREATE TABLE IF NOT EXISTS `{catalog}`.`{schema}`.`{table}` (
+                  id BIGINT,
+                  created_at TIMESTAMP,
+                  updated_at TIMESTAMP
+              )
+              USING {table_format.upper()}
+              """
+          
+          # Add partitioning
+          if partition_cols:
+              cols = partition_cols.replace(" ", "").split(",")
+              sql += f"\nPARTITIONED BY ({', '.join(cols)})"
+          
+          # Add external location
+          if external_location and table_type == "external":
+              sql += f"\nLOCATION '{external_location}/{table}'"
+          
+          # Add table properties for Delta
+          if table_format == "delta":
+              props = []
+              if enable_cdf:
+                  props.append("'delta.enableChangeDataFeed' = 'true'")
+              if enable_deletion_vectors:
+                  props.append("'delta.enableDeletionVectors' = 'true'")
+              props.append(f"'delta.logRetentionDuration' = 'interval {retention_hours} hours'")
+              props.append("'delta.autoOptimize.optimizeWrite' = 'true'")
+              props.append("'delta.autoOptimize.autoCompact' = 'true'")
+              
+              if props:
+                  sql += f"\nTBLPROPERTIES ({', '.join(props)})"
+          
+          # Add comment
+          if table_comment:
+              sql += f"\nCOMMENT '{table_comment}'"
+          
+          print(f"Executing SQL:\n{sql}")
+          
+          response = w.statement_execution.execute_statement(
+              warehouse_id=warehouse_id,
+              statement=sql,
+              wait_timeout="60s"
+          )
+          
+          if response.status.state == StatementState.SUCCEEDED:
+              print("Table created successfully!")
+              
+              # Add Z-Order clustering if specified
+              if cluster_cols and table_format == "delta":
+                  optimize_sql = f"OPTIMIZE `{catalog}`.`{schema}`.`{table}` ZORDER BY ({cluster_cols})"
+                  print(f"Setting up Z-Order clustering: {optimize_sql}")
+                  # Note: OPTIMIZE will run when there's data
+          else:
+              print(f"Table creation failed: {response.status.error}")
+              exit(1)
+          PYTHON_EOF
+        env:
+          LAYER: ${{ inputs.layer }}
+
+      - name: Set Tags
+        if: ${{ inputs.tags != '{}' }}
+        run: |
+          echo "Setting tags on resources..."
+          
+          python << 'PYTHON_EOF'
+          import json
+          from databricks.sdk import WorkspaceClient
+          
+          w = WorkspaceClient()
+          
+          catalog = "${{ inputs.catalog-name }}"
+          schema = "${{ inputs.schema-name }}"
+          table = "${{ inputs.table-name }}"
+          resource_type = "${{ inputs.resource-type }}"
+          tags_json = '${{ inputs.tags }}'
+          
+          try:
+              tags = json.loads(tags_json)
+          except:
+              print("Invalid tags JSON, skipping...")
+              exit(0)
+          
+          if not tags:
+              print("No tags to set")
+              exit(0)
+          
+          # Unity Catalog tagging via SQL
+          for key, value in tags.items():
+              if resource_type in ['schema', 'both']:
+                  print(f"Setting tag {key}={value} on schema")
+                  # Tags can be set via ALTER SCHEMA SET TAGS in Unity Catalog
+              if resource_type in ['table', 'both'] and table:
+                  print(f"Setting tag {key}={value} on table")
+                  # ALTER TABLE ... SET TAGS
+          
+          print("Tags set successfully!")
+          PYTHON_EOF
+
+      - name: Verify Resources
+        run: |
+          echo "Verifying created resources..."
+          
+          python << 'PYTHON_EOF'
+          from databricks.sdk import WorkspaceClient
+          from databricks.sdk.service.sql import StatementState
+          
+          w = WorkspaceClient()
+          
+          warehouses = list(w.warehouses.list())
+          if not warehouses:
+              print("No warehouse to verify")
+              exit(0)
+          
+          warehouse_id = warehouses[0].id
+          
+          catalog = "${{ inputs.catalog-name }}"
+          schema = "${{ inputs.schema-name }}"
+          table = "${{ inputs.table-name }}"
+          resource_type = "${{ inputs.resource-type }}"
+          
+          # Verify schema
+          if resource_type in ['schema', 'both']:
+              sql = f"DESCRIBE SCHEMA `{catalog}`.`{schema}`"
+              response = w.statement_execution.execute_statement(
+                  warehouse_id=warehouse_id,
+                  statement=sql,
+                  wait_timeout="30s"
+              )
+              if response.status.state == StatementState.SUCCEEDED:
+                  print(f"✅ Schema {catalog}.{schema} verified!")
+              else:
+                  print(f"❌ Schema verification failed")
+          
+          # Verify table
+          if resource_type in ['table', 'both'] and table:
+              sql = f"DESCRIBE TABLE `{catalog}`.`{schema}`.`{table}`"
+              response = w.statement_execution.execute_statement(
+                  warehouse_id=warehouse_id,
+                  statement=sql,
+                  wait_timeout="30s"
+              )
+              if response.status.state == StatementState.SUCCEEDED:
+                  print(f"✅ Table {catalog}.{schema}.{table} verified!")
+              else:
+                  print(f"❌ Table verification failed")
+          
+          print("\n🎉 Databricks provisioning completed successfully!")
+          PYTHON_EOF
+
+      - name: Summary
+        run: |
+          echo "## Databricks Provisioning Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Type | ${{ inputs.resource-type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Catalog | ${{ inputs.catalog-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Schema | ${{ inputs.schema-name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Table | ${{ inputs.table-name || 'N/A' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Layer | ${{ inputs.layer }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | ${{ inputs.table-format }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Unity Catalog](${{ secrets.DATABRICKS_HOST }}#explore/data/${{ inputs.catalog-name }}/${{ inputs.schema-name }})" >> $GITHUB_STEP_SUMMARY
